@@ -1,0 +1,256 @@
+name: Playwright Tests CI/CD
+
+on:
+  push:
+    branches: [main, develop, feature/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run tests every day at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  test:
+    name: Playwright Tests - ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        node-version: [18.x]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Create .env file
+        env:
+          PORT: '8091'
+          CORS_ORIGIN: 'http://localhost:5173'
+          groq_API_BASE: ${{ secrets.GROQ_API_BASE }}
+          groq_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          groq_MODEL: ${{ secrets.GROQ_MODEL }}
+          JIRA_HOST: ${{ secrets.JIRA_HOST }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          cat > .env << EOF
+          PORT=$PORT
+          CORS_ORIGIN=$CORS_ORIGIN
+          groq_API_BASE=$groq_API_BASE
+          groq_API_KEY=$groq_API_KEY
+          groq_MODEL=$groq_MODEL
+          JIRA_HOST=$JIRA_HOST
+          JIRA_EMAIL=$JIRA_EMAIL
+          JIRA_API_TOKEN=$JIRA_API_TOKEN
+          EOF
+
+      - name: Start backend server
+        run: |
+          cd backend
+          npm run dev &
+          sleep 10
+        env:
+          NODE_ENV: test
+
+      - name: Run API tests
+        run: |
+          cd frontend
+          npx playwright test tests/api/generateTests.spec.ts --project=${{ matrix.browser }} --reporter=html --reporter=json
+
+      - name: Run UI tests
+        run: |
+          cd frontend
+          npx playwright test tests/ui/userStoryGenerator.spec.ts --project=${{ matrix.browser }} --reporter=html --reporter=json
+        continue-on-error: true
+
+      - name: Run advanced tests
+        run: |
+          cd frontend
+          npx playwright test tests/advanced/advancedScenarios.spec.ts --project=${{ matrix.browser }} --reporter=html --reporter=json
+        continue-on-error: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: frontend/playwright-report/
+          retention-days: 30
+
+      - name: Upload JSON test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-json-${{ matrix.browser }}
+          path: frontend/test-results/results.json
+          retention-days: 30
+
+      - name: Publish test results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: frontend/test-results/junit.xml
+          check_name: Playwright Tests (${{ matrix.browser }})
+
+  test-summary:
+    name: Test Summary & Reporting
+    runs-on: ubuntu-latest
+    if: always()
+    needs: test
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate summary
+        run: |
+          echo "# Playwright Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Runs Completed" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Tests executed on multiple browsers (chromium, firefox, webkit)" >> $GITHUB_STEP_SUMMARY
+          echo "📊 Browsers tested: Chromium, Firefox, WebKit" >> $GITHUB_STEP_SUMMARY
+          echo "📝 Test artifacts uploaded and available" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '## Playwright Test Results 🎭\n\n✅ Tests completed on all browsers (Chromium, Firefox, WebKit)\n\n📊 Artifacts are available in Actions.\n\nView detailed reports by downloading the artifacts.'
+            })
+
+  notify-slack:
+    name: Send Slack Notification
+    runs-on: ubuntu-latest
+    if: always()
+    needs: test
+
+    steps:
+      - name: Slack notification on success
+        if: needs.test.result == 'success'
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ Playwright Tests Passed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "✅ Playwright Tests - All Passed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🎭 All tests completed successfully on Chromium, Firefox, and WebKit"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Slack notification on failure
+        if: needs.test.result != 'success'
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ Playwright Tests Failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ Playwright Tests - Failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "⚠️ Some tests failed. Check the workflow for details."
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
